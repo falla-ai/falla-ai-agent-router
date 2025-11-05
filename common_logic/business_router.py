@@ -54,6 +54,119 @@ def _get_dialogflow_client():
     return _dialogflow_client
 
 
+def _normalize_phone_number(phone: str) -> str:
+    """
+    Normaliza número de telefone removendo caracteres especiais.
+    
+    Args:
+        phone: Número de telefone (pode ter + no início)
+        
+    Returns:
+        Número normalizado (sem +)
+    """
+    return phone.lstrip('+').strip()
+
+
+def _generate_phone_variations(phone: str) -> list:
+    """
+    Gera variações do número de telefone para busca no Firestore.
+    
+    Para números brasileiros (começam com 55), gera variações com e sem o 9º dígito.
+    Também adiciona variação com + no início.
+    
+    Args:
+        phone: Número de telefone normalizado (sem +)
+        
+    Returns:
+        Lista de variações do número para tentar buscar
+    """
+    variations = []
+    
+    # Adicionar variação original (sem +)
+    variations.append(phone)
+    
+    # Adicionar variação com +
+    variations.append(f"+{phone}")
+    
+    # Se é número brasileiro (começa com 55)
+    if phone.startswith('55') and len(phone) >= 4:
+        # Formato: 55 + DDD (2 dígitos) + número
+        # Para números brasileiros celulares, o 9º dígito fica após o DDD
+        
+        if len(phone) == 12:
+            # Número sem 9º dígito (12 dígitos: 55 + 2 DDD + 8 números)
+            # Adicionar 9 na posição correta (após DDD)
+            # Exemplo: 555195357522 -> 5551995357522
+            ddd = phone[2:4]  # 2 dígitos do DDD
+            number = phone[4:]  # Resto do número
+            if len(number) == 8:  # Número de celular (8 dígitos)
+                with_9th = f"55{ddd}9{number}"
+                variations.append(with_9th)
+                variations.append(f"+{with_9th}")
+                logging.debug(f"Gerada variação com 9º dígito: {with_9th}")
+        
+        elif len(phone) == 13:
+            # Número com 9º dígito (13 dígitos: 55 + 2 DDD + 9 + 8 números)
+            # Remover 9 na posição 5 (após 55 + DDD)
+            # Exemplo: 5551995357522 -> 555195357522
+            if phone[4] == '9':  # Verifica se tem 9 na posição do 9º dígito
+                without_9th = f"55{phone[2:4]}{phone[5:]}"
+                variations.append(without_9th)
+                variations.append(f"+{without_9th}")
+                logging.debug(f"Gerada variação sem 9º dígito: {without_9th}")
+    
+    # Remover duplicatas mantendo ordem
+    seen = set()
+    unique_variations = []
+    for var in variations:
+        if var not in seen:
+            seen.add(var)
+            unique_variations.append(var)
+    
+    return unique_variations
+
+
+def _find_contact_by_phone(db, tenant_id: str, user_id: str):
+    """
+    Busca contato no Firestore tentando variações do número de telefone.
+    
+    Para números brasileiros, tenta buscar com e sem o 9º dígito.
+    
+    Args:
+        db: Cliente Firestore
+        tenant_id: ID do tenant
+        user_id: ID do usuário (número de telefone)
+        
+    Returns:
+        Tupla (documento do contato, user_id usado para encontrar) ou (None, None) se não encontrado
+        O documento sempre é retornado (mesmo que não exista), mas None indica que não foi encontrado
+    """
+    # Normalizar número (remover +)
+    normalized = _normalize_phone_number(user_id)
+    
+    # Gerar variações do número
+    variations = _generate_phone_variations(normalized)
+    
+    logging.debug(f"Buscando contato com variações: {variations[:3]}...")  # Log apenas primeiras 3
+    
+    # Tentar buscar cada variação
+    for phone_variant in variations:
+        try:
+            contact_doc_ref = db.collection(f'tenants/{tenant_id}/contacts').document(phone_variant)
+            contact_doc = contact_doc_ref.get()
+            
+            if contact_doc.exists:
+                logging.info(f"Contato encontrado com variação: {phone_variant} (original: {user_id})")
+                return contact_doc, phone_variant
+        except Exception as e:
+            logging.warning(f"Erro ao buscar contato com variação {phone_variant}: {e}")
+            continue
+    
+    # Não encontrou em nenhuma variação, retornar None para indicar que não foi encontrado
+    logging.info(f"Contato não encontrado para nenhuma variação de {user_id}")
+    return None, None
+
+
 def execute_business_routing(
     tenant_id: str,
     user_id: str,
@@ -76,8 +189,8 @@ def execute_business_routing(
         db = _get_firestore_client()
         
         # Lookup 2: Roteamento de Funil e Enriquecimento (Firestore)
-        contact_doc_ref = db.collection(f'tenants/{tenant_id}/contacts').document(user_id)
-        contact_doc = contact_doc_ref.get()
+        # Buscar contato tentando variações do número (com/sem 9º dígito para números brasileiros)
+        contact_doc, found_phone_id = _find_contact_by_phone(db, tenant_id, user_id)
         
         # Valores padrão BDR
         funnel_id = "core_bdr"
@@ -85,7 +198,7 @@ def execute_business_routing(
         context_score = "Lead inbound (BDR Padrão)"
         status = "bdr_inbound"
         
-        if contact_doc.exists:
+        if contact_doc is not None and contact_doc.exists:
             contact_data = contact_doc.to_dict()
             
             # Atualizar valores com fallbacks (usando nomes corretos do Firestore)
@@ -98,12 +211,20 @@ def execute_business_routing(
                 funnel_id = "core_sdr"
         else:
             # Criar documento com valores padrão se não existir
+            # Usar o número encontrado (se houver) ou o original normalizado (sem +)
+            if found_phone_id:
+                contact_phone_id = found_phone_id
+            else:
+                # Normalizar número original (remover +) para usar como ID do documento
+                contact_phone_id = _normalize_phone_number(user_id)
+            
+            contact_doc_ref = db.collection(f'tenants/{tenant_id}/contacts').document(contact_phone_id)
             contact_doc_ref.set({
                 "status": status,
                 "score": score,
                 "context_score": context_score
             })
-            logging.info(f"Documento de contato criado para {user_id} com valores padrão BDR")
+            logging.info(f"Documento de contato criado para {contact_phone_id} (original: {user_id}) com valores padrão BDR")
         
         # Lookup 3: Configuração do Agente (Firestore)
         tenant_doc_ref = db.collection('tenants').document(tenant_id)
