@@ -4,16 +4,56 @@ steps:
     args:
       - 'build'
       - '-t'
-      - 'gcr.io/$PROJECT_ID/router-service:$COMMIT_SHA'
+      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/router-service:${SHORT_SHA}'
       - '-t'
-      - 'gcr.io/$PROJECT_ID/router-service:latest'
+      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/router-service:latest'
+      - '-f'
+      - 'Dockerfile'
       - '.'
 
+  # Deploy no Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - '${_SERVICE_NAME}'
+      - '--image'
+      - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/router-service:${SHORT_SHA}'
+      - '--region'
+      - '${_REGION}'
+      - '--platform'
+      - 'managed'
+      - '--service-account'
+      - '${_SERVICE_ACCOUNT}'
+      - '--set-env-vars'
+      - 'GCP_PROJECT=${PROJECT_ID},META_APP_SECRET_NAME=${_META_APP_SECRET_NAME},WPP_INBOUND_TOPIC=${_WPP_INBOUND_TOPIC},DIALOGFLOW_LOCATION=${_DIALOGFLOW_LOCATION},DIALOGFLOW_AGENT_ID=${_DIALOGFLOW_AGENT_ID},WHATSAPP_API_VERSION=${_WHATSAPP_API_VERSION}'
+      - '--allow-unauthenticated'
+      - '--port'
+      - '8080'
+      - '--min-instances'
+      - '0'
+      - '--max-instances'
+      - '10'
+
 images:
-  - 'gcr.io/$PROJECT_ID/router-service:$COMMIT_SHA'
-  - 'gcr.io/$PROJECT_ID/router-service:latest'
+  - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/router-service:${SHORT_SHA}'
+  - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/router-service:latest'
 
 options:
-  machineType: 'E2_HIGHCPU_8'
   logging: CLOUD_LOGGING_ONLY
+  machineType: 'E2_HIGHCPU_8'
 
+substitutions:
+  # Configurações do serviço
+  _SERVICE_NAME: 'router-service'
+  _REGION: 'us-central1'
+  _REPOSITORY: 'cloud-run-source-deploy'
+  _SERVICE_ACCOUNT: 'router-service-sa@${PROJECT_ID}.iam.gserviceaccount.com'
+  
+  # Variáveis de ambiente (serão substituídas pelas variáveis do Cloud Build)
+  _META_APP_SECRET_NAME: 'meta-app-secret'
+  _WPP_INBOUND_TOPIC: 'wpp-inbound-topic'
+  _DIALOGFLOW_LOCATION: 'us-central1'
+  _DIALOGFLOW_AGENT_ID: '7f3455c5-9c67-4c51-a181-dfe3e5a60868'
+  _WHATSAPP_API_VERSION: 'v19.0'
