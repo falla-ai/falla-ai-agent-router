@@ -183,7 +183,7 @@ def execute_business_routing(
         message_text: Texto da mensagem recebida
         
     Returns:
-        Texto da resposta do agente ou None em caso de falha
+        Texto da resposta do agente ou None se contato não encontrado ou em caso de falha
     """
     try:
         db = _get_firestore_client()
@@ -192,39 +192,25 @@ def execute_business_routing(
         # Buscar contato tentando variações do número (com/sem 9º dígito para números brasileiros)
         contact_doc, found_phone_id = _find_contact_by_phone(db, tenant_id, user_id)
         
-        # Valores padrão BDR
-        funnel_id = "core_bdr"
-        score = 0  # Number conforme estrutura Firestore
-        context_score = "Lead inbound (BDR Padrão)"
-        status = "bdr_inbound"
+        # Se o contato não foi encontrado em nenhuma variação, finalizar sem enviar para Dialogflow
+        if contact_doc is None or not contact_doc.exists:
+            logging.warning(f"Contato não encontrado para {user_id} em nenhuma variação. Finalizando sem enviar para Dialogflow.")
+            return None
         
-        if contact_doc is not None and contact_doc.exists:
-            contact_data = contact_doc.to_dict()
-            
-            # Atualizar valores com fallbacks (usando nomes corretos do Firestore)
-            status = contact_data.get("status", status)
-            score = contact_data.get("score", score)
-            context_score = contact_data.get("context_score", context_score)
-            
-            # Lógica de roteamento: Se status começa com "sdr_", usar funnel "core_sdr"
-            if status and status.startswith("sdr_"):
-                funnel_id = "core_sdr"
-        else:
-            # Criar documento com valores padrão se não existir
-            # Usar o número encontrado (se houver) ou o original normalizado (sem +)
-            if found_phone_id:
-                contact_phone_id = found_phone_id
-            else:
-                # Normalizar número original (remover +) para usar como ID do documento
-                contact_phone_id = _normalize_phone_number(user_id)
-            
-            contact_doc_ref = db.collection(f'tenants/{tenant_id}/contacts').document(contact_phone_id)
-            contact_doc_ref.set({
-                "status": status,
-                "score": score,
-                "context_score": context_score
-            })
-            logging.info(f"Documento de contato criado para {contact_phone_id} (original: {user_id}) com valores padrão BDR")
+        # Contato encontrado - usar dados da coleção
+        contact_data = contact_doc.to_dict()
+        
+        # Extrair valores do contato (com fallbacks para segurança)
+        status = contact_data.get("status", "bdr_inbound")
+        score = contact_data.get("score", 0)
+        context_score = contact_data.get("context_score", "Lead inbound (BDR Padrão)")
+        
+        # Lógica de roteamento: Se status começa com "sdr_", usar funnel "core_sdr"
+        funnel_id = "core_bdr"
+        if status and status.startswith("sdr_"):
+            funnel_id = "core_sdr"
+        
+        logging.info(f"Contato encontrado: {found_phone_id} (original: {user_id}), status={status}, funnel_id={funnel_id}")
         
         # Lookup 3: Configuração do Agente (Firestore)
         tenant_doc_ref = db.collection('tenants').document(tenant_id)
