@@ -147,7 +147,7 @@ def _find_contact_by_phone(db, tenant_id: str, user_id: str):
     # Gerar variações do número
     variations = _generate_phone_variations(normalized)
     
-    logging.debug(f"Buscando contato com variações: {variations[:3]}...")  # Log apenas primeiras 3
+    logging.info(f"Buscando contato com variações: {variations[:3]}... (total: {len(variations)})")
     
     # Tentar buscar cada variação
     for phone_variant in variations:
@@ -190,6 +190,7 @@ def execute_business_routing(
         
         # Lookup 2: Roteamento de Funil e Enriquecimento (Firestore)
         # Buscar contato tentando variações do número (com/sem 9º dígito para números brasileiros)
+        logging.info(f"Iniciando busca de contato para user_id={user_id}, tenant_id={tenant_id}")
         contact_doc, found_phone_id = _find_contact_by_phone(db, tenant_id, user_id)
         
         # Se o contato não foi encontrado em nenhuma variação, finalizar sem enviar para Dialogflow
@@ -204,13 +205,15 @@ def execute_business_routing(
         status = contact_data.get("status", "bdr_inbound")
         score = contact_data.get("score", 0)
         context_score = contact_data.get("context_score", "Lead inbound (BDR Padrão)")
+        name = contact_data.get("name", "")
+        source_list = contact_data.get("source_list", "")
         
         # Lógica de roteamento: Se status começa com "sdr_", usar funnel "core_sdr"
         funnel_id = "core_bdr"
         if status and status.startswith("sdr_"):
             funnel_id = "core_sdr"
         
-        logging.info(f"Contato encontrado: {found_phone_id} (original: {user_id}), status={status}, funnel_id={funnel_id}")
+        logging.info(f"Contato encontrado: {found_phone_id} (original: {user_id}), status={status}, funnel_id={funnel_id}, name={name}, score={score}")
         
         # Lookup 3: Configuração do Agente (Firestore)
         tenant_doc_ref = db.collection('tenants').document(tenant_id)
@@ -261,7 +264,9 @@ def execute_business_routing(
             # Campos do contato (usando nomes corretos do Firestore)
             "status": status,
             "score": score,
-            "context_score": context_score
+            "context_score": context_score,
+            "name": name,
+            "source_list": source_list
         }
         
         # Chamada do Dialogflow CX
@@ -298,7 +303,10 @@ def execute_business_routing(
                 struct_params[key] = str(value)
         
         # Criar QueryParameters com os parâmetros
+        # CORREÇÃO: Inicializar parameters corretamente
         query_params = session.QueryParameters()
+        if query_params.parameters is None:
+            query_params.parameters = struct_pb2.Struct()
         query_params.parameters.update(struct_params)
         
         request = DetectIntentRequest(
