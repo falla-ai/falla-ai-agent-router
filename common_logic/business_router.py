@@ -67,6 +67,18 @@ def _normalize_phone_number(phone: str) -> str:
     return phone.lstrip('+').strip()
 
 
+def _to_bool(value: Any) -> bool:
+    """Converte diferentes representações para booleano."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        return normalized in {"true", "1", "yes", "sim", "y", "on"}
+    return False
+
+
 def _generate_phone_variations(phone: str) -> list:
     """
     Gera variações do número de telefone para busca no Firestore.
@@ -283,8 +295,25 @@ def execute_business_routing(
         if playbook_config_to_use is None:
             logging.error(f"[FASE 5] Tenant {tenant_id} não possui configuração para funnel_id '{funnel_id}'")
             return None
-        
+
+        if not isinstance(playbook_config_to_use, dict):
+            logging.error(f"[FASE 5] playbook_config_to_use não é um mapa/dict válido: tipo={type(playbook_config_to_use)}")
+            return None
+
         logging.info(f"[FASE 5] playbook_config_to_use encontrado: {type(playbook_config_to_use)}")
+
+        raw_playbook_status = playbook_config_to_use.get("status")
+        playbook_is_active = _to_bool(raw_playbook_status)
+        logging.info(
+            f"[FASE 5] status do playbook (raw={raw_playbook_status}, bool={playbook_is_active}) para funnel_id='{funnel_id}'"
+        )
+
+        if not playbook_is_active:
+            logging.error(
+                f"[FASE 5] Playbook '{funnel_id}' está inativo (status={raw_playbook_status}). "
+                "Encerrando processamento sem enviar ao Dialogflow."
+            )
+            return None
         
         # FASE 6: Extrair campos do playbook_config
         logging.info("[FASE 6] Extraindo campos do playbook_config...")
