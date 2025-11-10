@@ -62,10 +62,29 @@ class RagSearchService:
             os.environ.get("RAG_PROJECT_ID")
             or self.project_id
         )
-        self.default_collection = (
-            os.environ.get("RAG_COLLECTION_ID")
-            or "default_collection"
+        self.default_collection = os.environ.get(
+            "RAG_COLLECTION_ID", "default_collection"
         )
+        self.engine_id = os.environ.get("RAG_ENGINE_ID")
+        self.serving_config_id = os.environ.get(
+            "RAG_SERVING_CONFIG", "default_search"
+        )
+        self.default_language_code = os.environ.get(
+            "RAG_LANGUAGE_CODE", "pt-BR"
+        )
+        self.default_time_zone = os.environ.get(
+            "RAG_TIME_ZONE", "America/Sao_Paulo"
+        )
+        try:
+            self.default_page_size = int(
+                os.environ.get("RAG_DEFAULT_PAGE_SIZE", "10")
+            )
+        except ValueError:
+            logging.warning(
+                "[RagSearchService] Valor inválido em RAG_DEFAULT_PAGE_SIZE. "
+                "Usando 10."
+            )
+            self.default_page_size = 10
         self._db: Optional[firestore.Client] = None
         self._secret_client: Optional[secretmanager.SecretManagerServiceClient] = None
         self._search_clients: Dict[str, discoveryengine.SearchServiceClient] = {}
@@ -449,24 +468,24 @@ class RagSearchService:
         project_id = target.project_id or self.default_project
         collection_id = target.collection_id or self.default_collection
 
+        if not self.engine_id:
+            raise RagConfigurationError(
+                "RAG_ENGINE_ID não está configurado para o serviço de RAG"
+            )
+
         client = self._get_search_client(project_id, location)
 
-        data_store_path = target.data_store_id
-        if collection_id and collection_id != "default_collection":
-            data_store_path = f"collections/{collection_id}/dataStores/{target.data_store_id}"
-
-        serving_config_path = client.serving_config_path(
-            project=project_id,
-            location=location,
-            data_store=data_store_path,
-            serving_config="default_config",
+        serving_config_path = (
+            f"projects/{project_id}/locations/{location}/collections/{collection_id}"
+            f"/engines/{self.engine_id}/servingConfigs/{self.serving_config_id}"
         )
         logging.info(
             "[RagSearchService] Executando search (project=%s, location=%s, "
-            "collection=%s, data_store=%s, serving_config=%s, query='%s', summary_count=%s, citations=%s)",
+            "collection=%s, engine=%s, serving_config=%s, data_store=%s, query='%s', summary_count=%s, citations=%s)",
             project_id,
             location,
             collection_id,
+            self.engine_id,
             target.data_store_id,
             serving_config_path,
             query,
@@ -475,17 +494,33 @@ class RagSearchService:
         )
 
         try:
+            snippet_spec = discoveryengine.SearchRequest.ContentSearchSpec.SnippetSpec(
+                return_snippet=True
+            )
+            summary_spec = discoveryengine.SearchRequest.ContentSearchSpec.SummarySpec(
+                summary_result_count=summary_result_count,
+                include_citations=include_citations,
+                ignore_adversarial_query=True,
+            )
+            content_search_spec = discoveryengine.SearchRequest.ContentSearchSpec(
+                snippet_spec=snippet_spec,
+                summary_spec=summary_spec,
+            )
+            spell_correction_spec = discoveryengine.SearchRequest.SpellCorrectionSpec(
+                mode=discoveryengine.SearchRequest.SpellCorrectionSpec.Mode.AUTO
+            )
+
             search_request = discoveryengine.SearchRequest(
                 serving_config=serving_config_path,
                 query=query,
-                page_size=10,
-                content_search_spec=discoveryengine.SearchRequest.ContentSearchSpec(
-                    summary_spec=discoveryengine.SearchRequest.ContentSearchSpec.SummarySpec(
-                        summary_result_count=summary_result_count,
-                        include_citations=include_citations,
-                        ignore_adversarial_query=True,
-                    )
+                page_size=self.default_page_size,
+                language_code=self.default_language_code,
+                content_search_spec=content_search_spec,
+                user_info=discoveryengine.UserInfo(
+                    time_zone=self.default_time_zone
                 ),
+                params={"rag_datastore_id": target.data_store_id},
+                spell_correction_spec=spell_correction_spec,
             )
             response = client.search(request=search_request)
         except Exception as exc:
