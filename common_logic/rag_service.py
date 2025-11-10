@@ -220,6 +220,14 @@ class RagSearchService:
         for playbook_name, playbook_cfg in playbook_configs.items():
             if not isinstance(playbook_cfg, dict):
                 continue
+            raw_ds = playbook_cfg.get("rag_datastore_id") or playbook_cfg.get("rag_id")
+            logging.info(
+                "[RagSearchService] playbook=%s raw_datastore_id=%s raw_collection=%s raw_project=%s",
+                playbook_name,
+                raw_ds,
+                playbook_cfg.get("rag_collection_id"),
+                playbook_cfg.get("rag_project_id"),
+            )
             data_store_id = playbook_cfg.get("rag_datastore_id") or playbook_cfg.get(
                 "rag_id"
             )
