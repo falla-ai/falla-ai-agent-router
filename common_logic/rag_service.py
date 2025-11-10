@@ -550,9 +550,9 @@ class RagSearchService:
                 "Não encontrei uma resposta direta para essa pergunta nos meus documentos."
             )
 
-        if include_citations and response.summary and response.summary.reference_info:
-            reference_info = response.summary.reference_info
-            for citation in getattr(reference_info, "citations", []):
+        if include_citations and response.summary:
+            reference_info = getattr(response.summary, "reference_info", None)
+            for citation in getattr(reference_info, "citations", []) if reference_info else []:
                 citation_entry = {}
                 anchor = getattr(citation, "anchor", None)
                 uri = getattr(citation, "uri", None)
