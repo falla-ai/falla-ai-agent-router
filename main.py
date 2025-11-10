@@ -308,6 +308,18 @@ async def dynamic_rag_query(
 
     Exige autenticação via API Key e validação das configurações do tenant/playbook.
     """
+    logger.info(
+        "[/rag/query] Requisição recebida "
+        "(tenant_id=%s, playbook_name=%s, rag_identifier=%s, data_store_id=%s, "
+        "summary_result_count=%s, include_citations=%s, has_api_key=%s)",
+        payload.tenant_id,
+        payload.playbook_name,
+        payload.rag_identifier,
+        payload.data_store_id,
+        payload.summary_result_count,
+        payload.include_citations,
+        bool(x_api_key),
+    )
     try:
         result = rag_service.run_query(
             tenant_id=payload.tenant_id,
@@ -324,14 +336,25 @@ async def dynamic_rag_query(
         if payload.include_citations and result.citations:
             response_body["citations"] = result.citations
 
+        logger.info(
+            "[/rag/query] Resposta gerada "
+            "(tenant_id=%s, resumo_caracteres=%s, citations=%s)",
+            payload.tenant_id,
+            len(result.summary),
+            len(result.citations),
+        )
         return response_body
     except RagUnauthorizedError as exc:
+        logger.warning("[/rag/query] API key inválida/ausente: %s", exc)
         raise HTTPException(status_code=401, detail=str(exc)) from exc
     except RagNotFoundError as exc:
+        logger.warning("[/rag/query] Configuração não encontrada: %s", exc)
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except RagConfigurationError as exc:
+        logger.warning("[/rag/query] Configuração inválida: %s", exc)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RagServiceError as exc:
+        logger.error("[/rag/query] Erro ao consultar mecanismo RAG: %s", exc)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     except Exception as exc:
         logger.error("Erro inesperado ao processar consulta RAG: %s", exc, exc_info=True)

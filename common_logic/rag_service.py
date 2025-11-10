@@ -32,6 +32,8 @@ class RagStoreTarget:
 
     data_store_id: str
     location: str
+    project_id: str
+    collection_id: str
 
 
 @dataclass
@@ -55,6 +57,14 @@ class RagSearchService:
             os.environ.get("RAG_LOCATION")
             or os.environ.get("DISCOVERYENGINE_LOCATION")
             or "global"
+        )
+        self.default_project = (
+            os.environ.get("RAG_PROJECT_ID")
+            or self.project_id
+        )
+        self.default_collection = (
+            os.environ.get("RAG_COLLECTION_ID")
+            or "default_collection"
         )
         self._db: Optional[firestore.Client] = None
         self._secret_client: Optional[secretmanager.SecretManagerServiceClient] = None
@@ -101,10 +111,12 @@ class RagSearchService:
         return self._secret_client
 
     def _get_search_client(
-        self, location: str
+        self, project_id: str, location: str
     ) -> discoveryengine.SearchServiceClient:
         location_key = location or self.default_location
-        if location_key not in self._search_clients:
+        project_key = project_id or self.default_project
+        cache_key = f"{project_key}:{location_key}"
+        if cache_key not in self._search_clients:
             try:
                 endpoint = (
                     f"{location_key}-discoveryengine.googleapis.com"
@@ -112,23 +124,29 @@ class RagSearchService:
                     else "global-discoveryengine.googleapis.com"
                 )
                 client_options = {"api_endpoint": endpoint}
-                self._search_clients[location_key] = discoveryengine.SearchServiceClient(
-                    client_options=client_options
-                )
                 logging.info(
-                    "[RagSearchService] Cliente Discovery Engine inicializado. "
-                    "location=%s endpoint=%s",
-                    location_key,
+                    "[RagSearchService] Inicializando cliente Discovery Engine "
+                    "(cache_key=%s, endpoint=%s, project=%s, location=%s)",
+                    cache_key,
                     endpoint,
+                    project_key,
+                    location_key,
+                )
+                self._search_clients[cache_key] = discoveryengine.SearchServiceClient(
+                    client_options=client_options
                 )
             except Exception as exc:
                 logging.error(
-                    "[RagSearchService] Erro ao inicializar Discovery Engine: %s", exc
+                    "[RagSearchService] Erro ao inicializar Discovery Engine "
+                    "(project=%s, location=%s): %s",
+                    project_key,
+                    location_key,
+                    exc,
                 )
                 raise RagConfigurationError(
                     "Não foi possível inicializar o Discovery Engine"
                 ) from exc
-        return self._search_clients[location_key]
+        return self._search_clients[cache_key]
 
     # -------------------------------------------------------------------------
     # Segurança (API Key)
@@ -212,8 +230,28 @@ class RagSearchService:
                 or playbook_cfg.get("rag_region")
                 or self.default_location
             )
+            project_id = (
+                playbook_cfg.get("rag_project_id")
+                or self.default_project
+            )
+            collection_id = (
+                playbook_cfg.get("rag_collection_id")
+                or self.default_collection
+            )
+            logging.debug(
+                "[RagSearchService] playbook target detectado "
+                "(playbook=%s, project=%s, collection=%s, location=%s, data_store=%s)",
+                playbook_name,
+                project_id,
+                collection_id,
+                location,
+                data_store_id,
+            )
             targets[playbook_name] = RagStoreTarget(
-                data_store_id=data_store_id, location=location
+                data_store_id=data_store_id,
+                location=location,
+                project_id=project_id,
+                collection_id=collection_id,
             )
         return targets
 
@@ -234,8 +272,30 @@ class RagSearchService:
                 or rag_cfg.get("region")
                 or self.default_location
             )
+            project_id = (
+                rag_cfg.get("project_id")
+                or rag_cfg.get("rag_project_id")
+                or self.default_project
+            )
+            collection_id = (
+                rag_cfg.get("collection_id")
+                or rag_cfg.get("rag_collection_id")
+                or self.default_collection
+            )
+            logging.debug(
+                "[RagSearchService] rag_config target detectado "
+                "(alias=%s, project=%s, collection=%s, location=%s, data_store=%s)",
+                alias,
+                project_id,
+                collection_id,
+                location,
+                data_store_id,
+            )
             targets[alias] = RagStoreTarget(
-                data_store_id=data_store_id, location=location
+                data_store_id=data_store_id,
+                location=location,
+                project_id=project_id,
+                collection_id=collection_id,
             )
         return targets
 
@@ -285,6 +345,15 @@ class RagSearchService:
                     explicit_data_store_id,
                 )
                 raise RagUnauthorizedError("Data store não autorizado para este tenant")
+            logging.info(
+                "[RagSearchService] Data store explícito autorizado. tenant=%s, "
+                "project=%s, collection=%s, location=%s, data_store=%s",
+                tenant_id,
+                target.project_id,
+                target.collection_id,
+                target.location,
+                target.data_store_id,
+            )
             return target
 
         if playbook_name:
@@ -312,6 +381,16 @@ class RagSearchService:
                 raise RagConfigurationError(
                     f"Playbook '{playbook_name}' está inativo para o tenant"
                 )
+            logging.info(
+                "[RagSearchService] Playbook target selecionado. tenant=%s, playbook=%s, "
+                "project=%s, collection=%s, location=%s, data_store=%s",
+                tenant_id,
+                playbook_name,
+                target.project_id,
+                target.collection_id,
+                target.location,
+                target.data_store_id,
+            )
             return target
 
         if rag_identifier:
@@ -325,6 +404,16 @@ class RagSearchService:
                 raise RagUnauthorizedError(
                     "Identificador de RAG não autorizado para este tenant"
                 )
+            logging.info(
+                "[RagSearchService] rag_identifier selecionado. tenant=%s, identifier=%s, "
+                "project=%s, collection=%s, location=%s, data_store=%s",
+                tenant_id,
+                rag_identifier,
+                target.project_id,
+                target.collection_id,
+                target.location,
+                target.data_store_id,
+            )
             return target
 
         logging.warning(
@@ -349,13 +438,32 @@ class RagSearchService:
 
         summary_result_count = max(1, min(summary_result_count, 5))
         location = target.location or self.default_location
-        client = self._get_search_client(location)
+        project_id = target.project_id or self.default_project
+        collection_id = target.collection_id or self.default_collection
+
+        client = self._get_search_client(project_id, location)
+
+        data_store_path = target.data_store_id
+        if collection_id and collection_id != "default_collection":
+            data_store_path = f"collections/{collection_id}/dataStores/{target.data_store_id}"
 
         serving_config_path = client.serving_config_path(
-            project=self.project_id,
+            project=project_id,
             location=location,
-            data_store=target.data_store_id,
+            data_store=data_store_path,
             serving_config="default_config",
+        )
+        logging.info(
+            "[RagSearchService] Executando search (project=%s, location=%s, "
+            "collection=%s, data_store=%s, serving_config=%s, query='%s', summary_count=%s, citations=%s)",
+            project_id,
+            location,
+            collection_id,
+            target.data_store_id,
+            serving_config_path,
+            query,
+            summary_result_count,
+            include_citations,
         )
 
         try:
@@ -374,7 +482,13 @@ class RagSearchService:
             response = client.search(request=search_request)
         except Exception as exc:
             logging.error(
-                "[RagSearchService] Erro ao consultar Discovery Engine: %s", exc
+                "[RagSearchService] Erro ao consultar Discovery Engine "
+                "(project=%s, location=%s, collection=%s, data_store=%s): %s",
+                project_id,
+                location,
+                collection_id,
+                target.data_store_id,
+                exc,
             )
             raise RagServiceError("Falha ao consultar o mecanismo de busca") from exc
 
@@ -404,6 +518,14 @@ class RagSearchService:
                 if citation_entry:
                     citations.append(citation_entry)
 
+        logging.info(
+            "[RagSearchService] Consulta concluída (tenant_target_project=%s, data_store=%s). "
+            "Resumo obtido com %s caracteres e %s citações.",
+            project_id,
+            target.data_store_id,
+            len(summary_text),
+            len(citations),
+        )
         return RagSearchResult(summary=summary_text, citations=citations)
 
     # -------------------------------------------------------------------------
@@ -422,12 +544,32 @@ class RagSearchService:
         api_key: Optional[str] = None,
     ) -> RagSearchResult:
         self.verify_api_key(api_key)
+        logging.info(
+            "[RagSearchService] run_query iniciado "
+            "(tenant_id=%s, playbook_name=%s, rag_identifier=%s, data_store_id=%s, "
+            "summary_result_count=%s, include_citations=%s, api_key_present=%s)",
+            tenant_id,
+            playbook_name,
+            rag_identifier,
+            data_store_id,
+            summary_result_count,
+            include_citations,
+            bool(api_key),
+        )
 
         target = self.resolve_store_target(
             tenant_id=tenant_id,
             playbook_name=playbook_name,
             rag_identifier=rag_identifier,
             explicit_data_store_id=data_store_id,
+        )
+        logging.info(
+            "[RagSearchService] Target final selecionado "
+            "(project=%s, collection=%s, location=%s, data_store=%s)",
+            target.project_id,
+            target.collection_id,
+            target.location,
+            target.data_store_id,
         )
 
         return self.search(
