@@ -516,7 +516,6 @@ class RagSearchService:
                 page_size=self.default_page_size,
                 language_code=self.default_language_code,
                 content_search_spec=content_search_spec,
-                params={"rag_datastore_id": target.data_store_id},
                 spell_correction_spec=spell_correction_spec,
             )
             response = client.search(request=search_request)
