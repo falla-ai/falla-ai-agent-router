@@ -494,6 +494,14 @@ class RagSearchService:
         )
 
         try:
+            data_store_path = (
+                f"projects/{project_id}/locations/{location}/collections/{collection_id}"
+                f"/dataStores/{target.data_store_id}"
+            )
+            data_store_spec = discoveryengine.SearchRequest.DataStoreSpec(
+                data_store=data_store_path
+            )
+
             snippet_spec = discoveryengine.SearchRequest.ContentSearchSpec.SnippetSpec(
                 return_snippet=True
             )
@@ -517,6 +525,7 @@ class RagSearchService:
                 language_code=self.default_language_code,
                 content_search_spec=content_search_spec,
                 spell_correction_spec=spell_correction_spec,
+                data_store_specs=[data_store_spec],
             )
             response = client.search(request=search_request)
         except Exception as exc:
