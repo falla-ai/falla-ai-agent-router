@@ -486,8 +486,8 @@ class RagSearchService:
             location,
             collection_id,
             self.engine_id,
-            target.data_store_id,
             serving_config_path,
+            target.data_store_id,
             query,
             summary_result_count,
             include_citations,
@@ -516,9 +516,6 @@ class RagSearchService:
                 page_size=self.default_page_size,
                 language_code=self.default_language_code,
                 content_search_spec=content_search_spec,
-                user_info=discoveryengine.UserInfo(
-                    time_zone=self.default_time_zone
-                ),
                 params={"rag_datastore_id": target.data_store_id},
                 spell_correction_spec=spell_correction_spec,
             )
