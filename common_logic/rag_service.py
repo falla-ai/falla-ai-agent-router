@@ -543,11 +543,27 @@ class RagSearchService:
         summary_text = ""
         citations: List[Dict[str, Any]] = []
 
+        has_summary = False
         if response.summary and response.summary.summary_text:
-            summary_text = response.summary.summary_text
-        else:
+            skipped_reasons = getattr(response.summary, "summary_skipped_reasons", [])
+            if skipped_reasons:
+                logging.info(
+                    "[RagSearchService] Resumo não gerado pelo Discovery Engine. "
+                    "Motivos: %s",
+                    skipped_reasons,
+                )
+            else:
+                summary_text = response.summary.summary_text
+                has_summary = True
+
+        if not has_summary:
             fallback_parts: List[str] = []
-            for result in getattr(response, "results", []):
+            results = getattr(response, "results", [])
+            logging.info(
+                "[RagSearchService] Gerando fallback com snippets. Resultados=%s",
+                len(results),
+            )
+            for result in results:
                 document = getattr(result, "document", None)
                 if not document:
                     continue
