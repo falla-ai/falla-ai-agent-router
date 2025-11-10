@@ -546,8 +546,33 @@ class RagSearchService:
         if response.summary and response.summary.summary_text:
             summary_text = response.summary.summary_text
         else:
+            fallback_parts: List[str] = []
+            for result in getattr(response, "results", []):
+                document = getattr(result, "document", None)
+                if not document:
+                    continue
+
+                derived = getattr(document, "derived_struct_data", {})
+                title = derived.get("title") or getattr(document, "id", "")
+
+                snippets = [
+                    snippet_entry.get("snippet")
+                    for snippet_entry in derived.get("snippets", [])
+                    if isinstance(snippet_entry, dict)
+                    and snippet_entry.get("snippet_status") != "NO_SNIPPET_AVAILABLE"
+                    and snippet_entry.get("snippet")
+                ]
+
+                for snippet_text in snippets:
+                    if title:
+                        fallback_parts.append(f"{title}: {snippet_text}")
+                    else:
+                        fallback_parts.append(snippet_text)
+
             summary_text = (
-                "Não encontrei uma resposta direta para essa pergunta nos meus documentos."
+                "\n".join(fallback_parts)
+                if fallback_parts
+                else "Não encontrei uma resposta direta para essa pergunta nos meus documentos."
             )
 
         if include_citations and response.summary:
