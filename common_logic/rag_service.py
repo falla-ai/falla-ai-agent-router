@@ -6,7 +6,8 @@ from typing import Any, Dict, List, Optional
 
 import firebase_admin
 from firebase_admin import firestore
-from google.cloud import discoveryengine_v1alpha as discoveryengine
+from google.api_core.client_options import ClientOptions
+from google.cloud import discoveryengine_v1 as discoveryengine
 from google.cloud import secretmanager
 
 
@@ -34,6 +35,10 @@ class RagStoreTarget:
     location: str
     project_id: str
     collection_id: str
+    engine_id: Optional[str] = None
+    serving_config_id: Optional[str] = None
+    language_code: Optional[str] = None
+    page_size: Optional[int] = None
 
 
 @dataclass
@@ -142,7 +147,11 @@ class RagSearchService:
                     if location_key != "global"
                     else "global-discoveryengine.googleapis.com"
                 )
-                client_options = {"api_endpoint": endpoint}
+                client_options = (
+                    ClientOptions(api_endpoint=endpoint)
+                    if location_key != "global"
+                    else None
+                )
                 logging.info(
                     "[RagSearchService] Inicializando cliente Discovery Engine "
                     "(cache_key=%s, endpoint=%s, project=%s, location=%s)",
@@ -232,6 +241,55 @@ class RagSearchService:
             return value.strip().lower() in {"true", "1", "yes", "y", "on", "sim"}
         return False
 
+    def _coerce_page_size(self, value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            page_size = int(value)
+        except (TypeError, ValueError):
+            logging.warning(
+                "[RagSearchService] Valor inválido de page_size detectado (%s). Ignorando.",
+                value,
+            )
+            return None
+        if page_size <= 0:
+            logging.warning(
+                "[RagSearchService] page_size deve ser positivo. Valor recebido: %s",
+                page_size,
+            )
+            return None
+        return page_size
+
+    def _construct_target(
+        self,
+        *,
+        data_store_id: Optional[str],
+        location: Optional[str] = None,
+        project_id: Optional[str] = None,
+        collection_id: Optional[str] = None,
+        engine_id: Optional[str] = None,
+        serving_config_id: Optional[str] = None,
+        language_code: Optional[str] = None,
+        page_size: Optional[Any] = None,
+    ) -> Optional[RagStoreTarget]:
+        if not data_store_id:
+            return None
+        coerced_page_size = self._coerce_page_size(page_size)
+        return RagStoreTarget(
+            data_store_id=str(data_store_id).strip(),
+            location=(location or self.default_location).strip(),
+            project_id=(project_id or self.default_project).strip(),
+            collection_id=(collection_id or self.default_collection).strip(),
+            engine_id=str(engine_id).strip() if engine_id else None,
+            serving_config_id=(
+                str(serving_config_id).strip() if serving_config_id else None
+            ),
+            language_code=(
+                str(language_code).strip() if language_code else self.default_language_code
+            ),
+            page_size=coerced_page_size,
+        )
+
     def _extract_targets_from_playbooks(
         self, playbook_configs: Dict[str, Any]
     ) -> Dict[str, RagStoreTarget]:
@@ -257,14 +315,18 @@ class RagSearchService:
                 or playbook_cfg.get("rag_region")
                 or self.default_location
             )
-            project_id = (
-                playbook_cfg.get("rag_project_id")
-                or self.default_project
-            )
+            project_id = playbook_cfg.get("rag_project_id") or self.default_project
             collection_id = (
-                playbook_cfg.get("rag_collection_id")
-                or self.default_collection
+                playbook_cfg.get("rag_collection_id") or self.default_collection
             )
+            engine_id = playbook_cfg.get("rag_engine_id") or playbook_cfg.get(
+                "rag_engine"
+            )
+            serving_config_id = playbook_cfg.get(
+                "rag_serving_config_id"
+            ) or playbook_cfg.get("rag_serving_config")
+            language_code = playbook_cfg.get("rag_language_code")
+            page_size = playbook_cfg.get("rag_page_size")
             logging.debug(
                 "[RagSearchService] playbook target detectado "
                 "(playbook=%s, project=%s, collection=%s, location=%s, data_store=%s)",
@@ -274,12 +336,18 @@ class RagSearchService:
                 location,
                 data_store_id,
             )
-            targets[playbook_name] = RagStoreTarget(
+            target = self._construct_target(
                 data_store_id=data_store_id,
                 location=location,
                 project_id=project_id,
                 collection_id=collection_id,
+                engine_id=engine_id,
+                serving_config_id=serving_config_id,
+                language_code=language_code,
+                page_size=page_size,
             )
+            if target:
+                targets[playbook_name] = target
         return targets
 
     def _extract_targets_from_rag_configs(
@@ -309,6 +377,16 @@ class RagSearchService:
                 or rag_cfg.get("rag_collection_id")
                 or self.default_collection
             )
+            engine_id = rag_cfg.get("rag_engine_id") or rag_cfg.get("engine_id")
+            serving_config_id = (
+                rag_cfg.get("rag_serving_config_id")
+                or rag_cfg.get("serving_config_id")
+                or rag_cfg.get("rag_serving_config")
+            )
+            language_code = rag_cfg.get("rag_language_code") or rag_cfg.get(
+                "language_code"
+            )
+            page_size = rag_cfg.get("rag_page_size") or rag_cfg.get("page_size")
             logging.debug(
                 "[RagSearchService] rag_config target detectado "
                 "(alias=%s, project=%s, collection=%s, location=%s, data_store=%s)",
@@ -318,13 +396,47 @@ class RagSearchService:
                 location,
                 data_store_id,
             )
-            targets[alias] = RagStoreTarget(
+            target = self._construct_target(
                 data_store_id=data_store_id,
                 location=location,
                 project_id=project_id,
                 collection_id=collection_id,
+                engine_id=engine_id,
+                serving_config_id=serving_config_id,
+                language_code=language_code,
+                page_size=page_size,
             )
+            if target:
+                targets[alias] = target
         return targets
+
+    def _extract_target_from_tenant_root(
+        self, tenant_data: Dict[str, Any]
+    ) -> Optional[RagStoreTarget]:
+        data_store_id = tenant_data.get("rag_datastore_id") or tenant_data.get(
+            "rag_data_store_id"
+        )
+        if not data_store_id:
+            return None
+        location = tenant_data.get("rag_location") or tenant_data.get("rag_region")
+        project_id = tenant_data.get("rag_project_id") or tenant_data.get("project_id")
+        collection_id = tenant_data.get("rag_collection_id")
+        engine_id = tenant_data.get("rag_engine_id") or tenant_data.get("rag_engine")
+        serving_config_id = tenant_data.get("rag_serving_config_id") or tenant_data.get(
+            "rag_serving_config"
+        )
+        language_code = tenant_data.get("rag_language_code")
+        page_size = tenant_data.get("rag_page_size")
+        return self._construct_target(
+            data_store_id=data_store_id,
+            location=location,
+            project_id=project_id,
+            collection_id=collection_id,
+            engine_id=engine_id,
+            serving_config_id=serving_config_id,
+            language_code=language_code,
+            page_size=page_size,
+        )
 
     def resolve_store_target(
         self,
@@ -350,6 +462,7 @@ class RagSearchService:
         rag_targets = self._extract_targets_from_rag_configs(
             tenant_data.get("rag_configs", {})
         )
+        tenant_default_target = self._extract_target_from_tenant_root(tenant_data)
 
         allowed_targets: Dict[str, RagStoreTarget] = {}
 
@@ -360,7 +473,13 @@ class RagSearchService:
         allowed_targets.update(rag_targets)
 
         # Targets acessíveis diretamente pelo ID do data store
-        for target in list(playbook_targets.values()) + list(rag_targets.values()):
+        aggregated_targets = list(playbook_targets.values()) + list(
+            rag_targets.values()
+        )
+        if tenant_default_target:
+            allowed_targets["__tenant_default__"] = tenant_default_target
+            aggregated_targets.append(tenant_default_target)
+        for target in aggregated_targets:
             allowed_targets[target.data_store_id] = target
 
         if explicit_data_store_id:
@@ -443,6 +562,18 @@ class RagSearchService:
             )
             return target
 
+        if tenant_default_target:
+            logging.info(
+                "[RagSearchService] Target padrão do tenant selecionado. tenant=%s, "
+                "project=%s, collection=%s, location=%s, data_store=%s",
+                tenant_id,
+                tenant_default_target.project_id,
+                tenant_default_target.collection_id,
+                tenant_default_target.location,
+                tenant_default_target.data_store_id,
+            )
+            return tenant_default_target
+
         logging.warning(
             "[RagSearchService] Nenhum identificador de data store informado"
         )
@@ -467,8 +598,12 @@ class RagSearchService:
         location = target.location or self.default_location
         project_id = target.project_id or self.default_project
         collection_id = target.collection_id or self.default_collection
+        engine_id = target.engine_id or self.engine_id
+        serving_config_id = target.serving_config_id or self.serving_config_id
+        language_code = target.language_code or self.default_language_code
+        page_size = target.page_size or self.default_page_size
 
-        if not self.engine_id:
+        if not engine_id:
             raise RagConfigurationError(
                 "RAG_ENGINE_ID não está configurado para o serviço de RAG"
             )
@@ -477,20 +612,22 @@ class RagSearchService:
 
         serving_config_path = (
             f"projects/{project_id}/locations/{location}/collections/{collection_id}"
-            f"/engines/{self.engine_id}/servingConfigs/{self.serving_config_id}"
+            f"/engines/{engine_id}/servingConfigs/{serving_config_id}"
         )
         logging.info(
             "[RagSearchService] Executando search (project=%s, location=%s, "
-            "collection=%s, engine=%s, serving_config=%s, data_store=%s, query='%s', summary_count=%s, citations=%s)",
+            "collection=%s, engine=%s, serving_config=%s, data_store=%s, query='%s', summary_count=%s, citations=%s, page_size=%s, language_code=%s)",
             project_id,
             location,
             collection_id,
-            self.engine_id,
+            engine_id,
             serving_config_path,
             target.data_store_id,
             query,
             summary_result_count,
             include_citations,
+            page_size,
+            language_code,
         )
 
         try:
@@ -538,8 +675,8 @@ class RagSearchService:
             search_request = discoveryengine.SearchRequest(
                 serving_config=serving_config_path,
                 query=query,
-                page_size=self.default_page_size,
-                language_code=self.default_language_code,
+                page_size=page_size,
+                language_code=language_code,
                 content_search_spec=content_search_spec,
                 spell_correction_spec=spell_correction_spec,
                 data_store_specs=[data_store_spec],
