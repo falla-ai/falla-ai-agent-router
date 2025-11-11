@@ -501,21 +501,38 @@ class RagSearchService:
             data_store_spec = discoveryengine.SearchRequest.DataStoreSpec(
                 data_store=data_store_path
             )
-
             snippet_spec = discoveryengine.SearchRequest.ContentSearchSpec.SnippetSpec(
-                return_snippet=True
+                return_snippet=True,
+                max_snippet_count=5,
             )
             summary_spec = discoveryengine.SearchRequest.ContentSearchSpec.SummarySpec(
                 summary_result_count=summary_result_count,
                 include_citations=include_citations,
                 ignore_adversarial_query=True,
+                model_prompt_spec=discoveryengine.SearchRequest.ContentSearchSpec.SummarySpec.ModelPromptSpec(
+                    preamble=(
+                        "Responda à pergunta do usuário de forma concisa e factual, "
+                        "baseando-se estritamente nos documentos fornecidos. "
+                        "Use o português do Brasil."
+                    )
+                ),
+            )
+            extractive_content_spec = (
+                discoveryengine.SearchRequest.ContentSearchSpec.ExtractiveContentSpec(
+                    max_extractive_answer_count=1,
+                    max_extractive_segment_count=5,
+                )
             )
             content_search_spec = discoveryengine.SearchRequest.ContentSearchSpec(
                 snippet_spec=snippet_spec,
                 summary_spec=summary_spec,
+                extractive_content_spec=extractive_content_spec,
             )
             spell_correction_spec = discoveryengine.SearchRequest.SpellCorrectionSpec(
                 mode=discoveryengine.SearchRequest.SpellCorrectionSpec.Mode.AUTO
+            )
+            query_expansion_spec = discoveryengine.SearchRequest.QueryExpansionSpec(
+                condition=discoveryengine.SearchRequest.QueryExpansionSpec.Condition.AUTO
             )
 
             search_request = discoveryengine.SearchRequest(
@@ -526,6 +543,7 @@ class RagSearchService:
                 content_search_spec=content_search_spec,
                 spell_correction_spec=spell_correction_spec,
                 data_store_specs=[data_store_spec],
+                query_expansion_spec=query_expansion_spec,
             )
             response = client.search(request=search_request)
         except Exception as exc:
@@ -584,6 +602,24 @@ class RagSearchService:
                         fallback_parts.append(f"{title}: {snippet_text}")
                     else:
                         fallback_parts.append(snippet_text)
+
+                extractive_answers = getattr(result, "extractive_answers", [])
+                for answer in extractive_answers:
+                    content = getattr(answer, "content", None)
+                    if content:
+                        if title:
+                            fallback_parts.append(f"{title}: {content}")
+                        else:
+                            fallback_parts.append(content)
+
+                extractive_segments = getattr(result, "extractive_segments", [])
+                for segment in extractive_segments:
+                    content = getattr(segment, "content", None)
+                    if content:
+                        if title:
+                            fallback_parts.append(f"{title}: {content}")
+                        else:
+                            fallback_parts.append(content)
 
             summary_text = (
                 "\n".join(fallback_parts)
