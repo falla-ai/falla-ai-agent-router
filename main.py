@@ -7,8 +7,7 @@ import os
 import logging
 from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, HTTPException, Query, Request, Response, Header
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 
 from handler.meta import MetaHandler
@@ -17,13 +16,9 @@ from handler.instagram import InstagramHandler
 from router.meta import MetaRouter
 from router.linkedin import LinkedInRouter
 from router.instagram import InstagramRouter
-from common_logic.business_router import execute_business_routing
-from common_logic.rag_service import (
-    RagConfigurationError,
-    RagNotFoundError,
-    RagSearchService,
-    RagServiceError,
-    RagUnauthorizedError,
+from common_logic.business_router import (
+    execute_business_routing,
+    save_message_and_update_conversation,
 )
 
 # Configuração de logging
@@ -35,9 +30,6 @@ app = FastAPI(title="Router Service - Unified Handler & Router")
 
 # Configurações
 PROJECT_ID = os.environ.get("GCP_PROJECT")
-
-# Serviço RAG
-rag_service = RagSearchService()
 
 # Registro de handlers e routers por plataforma
 HANDLERS: Dict[str, object] = {
@@ -211,8 +203,10 @@ async def pubsub_handler(request: Request):
         logger.info(f"Lookup 1 concluído: tenant_id={tenant_id}, channel_id={channel_id}, platform={platform}")
         
         # Chamar lógica de negócio compartilhada
+        response_text = None
+        contact_name = None
         try:
-            response_text = execute_business_routing(
+            response_text, contact_name = execute_business_routing(
                 tenant_id=tenant_id,
                 user_id=user_id,
                 channel_id=channel_id,
@@ -221,6 +215,22 @@ async def pubsub_handler(request: Request):
         except Exception as e:
             logger.error(f"Erro ao executar roteamento de negócio: {e}", exc_info=True)
             response_text = None
+            contact_name = None
+        
+        # Salvar mensagem do usuário no Firestore
+        # Fazemos isso após execute_business_routing para ter o contact_name disponível
+        # Mesmo se o roteamento falhar, salvamos a mensagem do usuário
+        try:
+            save_message_and_update_conversation(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                message_text=message_text,
+                sender="user",
+                contact_name=contact_name
+            )
+        except Exception as e:
+            # Não falhar o fluxo se houver erro ao salvar mensagem
+            logger.warning(f"Erro ao salvar mensagem do usuário: {e}", exc_info=True)
         
         # Lógica de Saída (Outbound)
         if response_text:
@@ -242,6 +252,19 @@ async def pubsub_handler(request: Request):
                     
                     if success:
                         logger.info(f"Resposta enviada com sucesso para user_id={user_id}")
+                        
+                        # Salvar mensagem do agente no Firestore após envio bem-sucedido
+                        try:
+                            save_message_and_update_conversation(
+                                tenant_id=tenant_id,
+                                user_id=user_id,
+                                message_text=response_text,
+                                sender="agent",
+                                contact_name=contact_name
+                            )
+                        except Exception as e:
+                            # Não falhar o fluxo se houver erro ao salvar mensagem
+                            logger.warning(f"Erro ao salvar mensagem do agente: {e}", exc_info=True)
                     else:
                         logger.error(f"Falha ao enviar resposta para user_id={user_id}")
                         
@@ -270,95 +293,6 @@ async def pubsub_handler(request: Request):
 async def health_check():
     """Endpoint de health check."""
     return {"status": "healthy", "service": "unified-router"}
-
-
-# ========== ENDPOINT RAG ==========
-
-class RagQueryRequest(BaseModel):
-    tenant_id: str = Field(..., description="Identificador do tenant")
-    query: str = Field(..., min_length=1, description="Pergunta do usuário final")
-    playbook_name: Optional[str] = Field(
-        None, description="Identificador do playbook configurado para o tenant"
-    )
-    rag_identifier: Optional[str] = Field(
-        None, description="Alias opcional do data store configurado para o tenant"
-    )
-    data_store_id: Optional[str] = Field(
-        None, description="ID explícito do data store (validado contra o tenant)"
-    )
-    summary_result_count: int = Field(
-        1,
-        ge=1,
-        le=5,
-        description="Número máximo de parágrafos no resumo retornado",
-    )
-    include_citations: bool = Field(
-        False,
-        description="Inclui metadados de citações quando suportado pelo data store",
-    )
-
-
-@app.post("/rag/query")
-async def dynamic_rag_query(
-    payload: RagQueryRequest,
-    x_api_key: Optional[str] = Header(None, alias="X-Api-Key"),
-):
-    """
-    Endpoint para consultas dinâmicas ao mecanismo de RAG (Vertex AI Search).
-
-    Exige autenticação via API Key e validação das configurações do tenant/playbook.
-    """
-    logger.info(
-        "[/rag/query] Requisição recebida "
-        "(tenant_id=%s, playbook_name=%s, rag_identifier=%s, data_store_id=%s, "
-        "summary_result_count=%s, include_citations=%s, has_api_key=%s)",
-        payload.tenant_id,
-        payload.playbook_name,
-        payload.rag_identifier,
-        payload.data_store_id,
-        payload.summary_result_count,
-        payload.include_citations,
-        bool(x_api_key),
-    )
-    try:
-        result = rag_service.run_query(
-            tenant_id=payload.tenant_id,
-            query=payload.query,
-            playbook_name=payload.playbook_name,
-            rag_identifier=payload.rag_identifier,
-            data_store_id=payload.data_store_id,
-            summary_result_count=payload.summary_result_count,
-            include_citations=payload.include_citations,
-            api_key=x_api_key,
-        )
-
-        response_body: Dict[str, Any] = {"rag_response": result.summary}
-        if payload.include_citations and result.citations:
-            response_body["citations"] = result.citations
-
-        logger.info(
-            "[/rag/query] Resposta gerada "
-            "(tenant_id=%s, resumo_caracteres=%s, citations=%s)",
-            payload.tenant_id,
-            len(result.summary),
-            len(result.citations),
-        )
-        return response_body
-    except RagUnauthorizedError as exc:
-        logger.warning("[/rag/query] API key inválida/ausente: %s", exc)
-        raise HTTPException(status_code=401, detail=str(exc)) from exc
-    except RagNotFoundError as exc:
-        logger.warning("[/rag/query] Configuração não encontrada: %s", exc)
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except RagConfigurationError as exc:
-        logger.warning("[/rag/query] Configuração inválida: %s", exc)
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except RagServiceError as exc:
-        logger.error("[/rag/query] Erro ao consultar mecanismo RAG: %s", exc)
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    except Exception as exc:
-        logger.error("Erro inesperado ao processar consulta RAG: %s", exc, exc_info=True)
-        raise HTTPException(status_code=500, detail="Erro interno ao consultar RAG") from exc
 
 
 # ========== MAIN ==========

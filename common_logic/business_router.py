@@ -6,7 +6,7 @@ Implementa a lógica de roteamento de mensagens usando Firestore e Dialogflow CX
 import os
 import json
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -175,12 +175,177 @@ def _find_contact_by_phone(db, tenant_id: str, user_id: str):
     return None, None
 
 
+def _validate_tenant_exists(db, tenant_id: str) -> bool:
+    """
+    Valida se o tenant existe no Firestore.
+    
+    Segurança multi-tenant: garante que não escrevemos em tenant inexistente.
+    
+    Args:
+        db: Cliente Firestore
+        tenant_id: ID do tenant a validar
+        
+    Returns:
+        True se o tenant existe, False caso contrário
+    """
+    try:
+        tenant_ref = db.collection("tenants").document(tenant_id)
+        tenant_doc = tenant_ref.get()
+        return tenant_doc.exists
+    except Exception as e:
+        logging.error(
+            "[_validate_tenant_exists] erro ao validar tenant=%s: %s",
+            tenant_id,
+            e,
+            exc_info=True,
+        )
+        return False
+
+
+def save_message_and_update_conversation(
+    tenant_id: str,
+    user_id: str,
+    message_text: str,
+    sender: str,
+    contact_name: Optional[str] = None
+) -> bool:
+    """
+    Salva mensagem no Firestore e atualiza o documento de conversa.
+    
+    Segue a estrutura definida:
+    - /tenants/{tenant_id}/conversations/{user_id}/messages/{message_id}
+    - /tenants/{tenant_id}/conversations/{user_id} (atualiza last_message_*)
+    
+    Segurança multi-tenant:
+    - Valida que o tenant existe antes de escrever
+    - Usa caminhos explícitos com tenant_id para evitar vazamento de dados
+    - Normaliza user_id para garantir consistência
+    
+    Args:
+        tenant_id: ID do tenant (validado antes de escrever)
+        user_id: ID do usuário (número de telefone E.164)
+        message_text: Texto da mensagem
+        sender: "user" ou "agent"
+        contact_name: Nome do contato (opcional, usado para atualizar conversa)
+        
+    Returns:
+        True se salvou com sucesso, False caso contrário
+    """
+    if not tenant_id or not isinstance(tenant_id, str) or not tenant_id.strip():
+        logging.error(
+            "[save_message_and_update_conversation] tenant_id inválido: %s",
+            tenant_id
+        )
+        return False
+    
+    if not user_id or not isinstance(user_id, str) or not user_id.strip():
+        logging.error(
+            "[save_message_and_update_conversation] user_id inválido: %s",
+            user_id
+        )
+        return False
+    
+    if not message_text or not isinstance(message_text, str) or not message_text.strip():
+        logging.error(
+            "[save_message_and_update_conversation] message_text inválido ou vazio"
+        )
+        return False
+    
+    if sender not in ("user", "agent"):
+        logging.error(
+            "[save_message_and_update_conversation] sender inválido: %s (deve ser 'user' ou 'agent')",
+            sender
+        )
+        return False
+    
+    try:
+        db = _get_firestore_client()
+        from google.cloud.firestore import SERVER_TIMESTAMP
+        
+        # SEGURANÇA MULTI-TENANT: Validar que o tenant existe antes de escrever
+        if not _validate_tenant_exists(db, tenant_id):
+            logging.error(
+                "[save_message_and_update_conversation] tenant não existe: %s",
+                tenant_id
+            )
+            return False
+        
+        # Normalizar user_id (mesmo formato usado em contacts)
+        # Remove caracteres especiais para garantir consistência
+        normalized_user_id = _normalize_phone_number(user_id)
+        
+        if not normalized_user_id:
+            logging.error(
+                "[save_message_and_update_conversation] user_id normalizado vazio: %s",
+                user_id
+            )
+            return False
+        
+        # SEGURANÇA: Construir caminho explícito com tenant_id para evitar vazamento
+        # Garantir que o caminho sempre começa com tenants/{tenant_id}
+        conversation_path = f"tenants/{tenant_id}/conversations"
+        conversation_ref = db.collection(conversation_path).document(normalized_user_id)
+        messages_ref = conversation_ref.collection("messages")
+        
+        # Criar batch write para atomicidade (tudo ou nada)
+        batch = db.batch()
+        
+        # 1. Adicionar mensagem na subcoleção
+        # Auto-ID garante ordem cronológica e evita colisões
+        message_ref = messages_ref.document()
+        batch.set(message_ref, {
+            "text": message_text.strip(),
+            "sender": sender,
+            "timestamp": SERVER_TIMESTAMP,
+        })
+        
+        # 2. Atualizar documento de conversa
+        conversation_update = {
+            "last_message_text": message_text.strip(),
+            "last_message_timestamp": SERVER_TIMESTAMP,
+        }
+        
+        # Se tiver nome do contato, incluir no documento de conversa
+        if contact_name and isinstance(contact_name, str) and contact_name.strip():
+            conversation_update["name"] = contact_name.strip()
+        
+        # Usar merge=True para não sobrescrever campos existentes
+        batch.set(conversation_ref, conversation_update, merge=True)
+        
+        # Executar batch (atomicidade garantida)
+        batch.commit()
+        
+        logging.info(
+            "[save_message_and_update_conversation] mensagem salva com sucesso "
+            "tenant=%s user=%s sender=%s text_len=%s",
+            tenant_id,
+            normalized_user_id,
+            sender,
+            len(message_text),
+        )
+        return True
+        
+    except Exception as e:
+        # Não propagar exceção - apenas logar erro
+        # O fluxo principal não deve falhar se houver erro ao salvar mensagem
+        logging.error(
+            "[save_message_and_update_conversation] erro ao salvar mensagem "
+            "tenant=%s user=%s sender=%s: %s",
+            tenant_id,
+            user_id,
+            sender,
+            e,
+            exc_info=True,
+        )
+        return False
+
+
 def execute_business_routing(
     tenant_id: str,
     user_id: str,
     channel_id: str,
     message_text: str
-) -> Optional[str]:
+) -> Tuple[Optional[str], Optional[str]]:
     """
     Função principal de roteamento de negócio.
     
@@ -191,7 +356,9 @@ def execute_business_routing(
         message_text: Texto da mensagem recebida
         
     Returns:
-        Texto da resposta do agente ou None se contato não encontrado ou em caso de falha
+        Tupla (response_text, contact_name):
+        - response_text: Texto da resposta do agente ou None se contato não encontrado ou em caso de falha
+        - contact_name: Nome do contato ou None se não encontrado
     """
     try:
         logging.info(
@@ -209,7 +376,7 @@ def execute_business_routing(
                 tenant_id,
                 user_id,
             )
-            return None
+            return None, None
 
         contact_data = contact_doc.to_dict()
         status = contact_data.get("status", "bdr_inbound")
@@ -233,7 +400,7 @@ def execute_business_routing(
         tenant_doc = db.collection("tenants").document(tenant_id).get()
         if not tenant_doc.exists:
             logging.error("[execute_business_routing] tenant não encontrado=%s", tenant_id)
-            return None
+            return None, name
 
         playbook_configs = tenant_doc.to_dict().get("playbook_configs", {})
         playbook_config = playbook_configs.get(funnel_id)
@@ -243,7 +410,7 @@ def execute_business_routing(
                 tenant_id,
                 funnel_id,
             )
-            return None
+            return None, name
 
         if not _to_bool(playbook_config.get("status", True)):
             logging.warning(
@@ -251,7 +418,7 @@ def execute_business_routing(
                 tenant_id,
                 funnel_id,
             )
-            return None
+            return None, name
 
         playbook_params = {
             f"playbook_{key}": value
@@ -274,7 +441,7 @@ def execute_business_routing(
 
         if not AGENT_ID:
             logging.error("[execute_business_routing] variável DIALOGFLOW_AGENT_ID ausente")
-            return None
+            return None, name
 
         dialogflow_client = _get_dialogflow_client()
         session_path = dialogflow_client.session_path(PROJECT_ID, LOCATION, AGENT_ID, user_id)
@@ -307,7 +474,7 @@ def execute_business_routing(
             response = dialogflow_client.detect_intent(request=request)
         except Exception as e:
             logging.error("[execute_business_routing] erro no Dialogflow: %s", e, exc_info=True)
-            return None
+            return None, name
 
         response_messages = [
             " ".join(msg.text.text)
@@ -316,7 +483,7 @@ def execute_business_routing(
         ]
         if not response_messages:
             logging.info("[execute_business_routing] Dialogflow não retornou mensagem")
-            return None
+            return None, name
 
         response_text = " ".join(response_messages)
         logging.info(
@@ -325,9 +492,9 @@ def execute_business_routing(
             user_id,
             len(response_text),
         )
-        return response_text
+        return response_text, name
 
     except Exception as e:
         logging.error("[execute_business_routing] falha inesperada: %s", e, exc_info=True)
-        return None
+        return None, None
 
